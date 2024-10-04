@@ -3,6 +3,7 @@ const app = express();
 const cors = require("cors");
 var jwt = require("jsonwebtoken");
 require("dotenv").config();
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const port = process.env.PORT || 5000;
 
 //middleware
@@ -24,13 +25,16 @@ const client = new MongoClient(uri, {
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
-    await client.connect();
+    // await client.connect();
     const menuCollection = client.db("bistroPracticeDB").collection("menu");
     const reviewsCollection = client
       .db("bistroPracticeDB")
       .collection("reviews");
     const cartsCollection = client.db("bistroPracticeDB").collection("carts");
     const usersCollection = client.db("bistroPracticeDB").collection("users");
+    const paymentsCollection = client
+      .db("bistroPracticeDB")
+      .collection("payments");
 
     // jwt related api
     app.post("/jwt", async (req, res) => {
@@ -187,8 +191,139 @@ async function run() {
       res.send(result);
     });
 
+    // payment intent
+    app.post("/create-payment-intent", async (req, res) => {
+      const { price } = req.body;
+      const amount = parseInt(price * 100);
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: "usd",
+        payment_method_types: ["card"],
+      });
+      res.send({ clientSecret: paymentIntent.client_secret });
+
+      // const { price } = req.body;
+      // try {
+      //   const paymentIntent = await stripe.paymentIntents.create({
+      //     amount: Math.round(price * 100), // Convert to cents
+      //     currency: "usd",
+      //   });
+      //   res.send({ clientSecret: paymentIntent.client_secret });
+      // } catch (error) {
+      //   console.error("Error creating payment intent:", error);
+      //   res.status(500).send("Internal Server Error");
+      // }
+    });
+
+    // payment related api
+
+    app.get("/payment/:email", verifyToken, async (req, res) => {
+      const query = { email: req.params.email };
+      if (req.params.email !== req?.decoded.email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      const result = await paymentsCollection.find(query).toArray();
+      res.send(result);
+    });
+
+    app.post("/payment", async (req, res) => {
+      const payment = req.body;
+      console.log(payment);
+      const paymentResult = await paymentsCollection.insertOne(payment);
+      //carefully each item delete from the cart
+      const query = {
+        _id: {
+          $in: payment.cartIds.map((id) => new ObjectId(id)),
+        },
+      };
+      const deleteResult = await cartsCollection.deleteMany(query);
+
+      res.send({ paymentResult, deleteResult });
+    });
+
+    // stats or analytics
+
+    app.get("/admin-stats", verifyToken, verifyAdmin, async (req, res) => {
+      const users = await usersCollection.estimatedDocumentCount();
+      const menuItems = await menuCollection.estimatedDocumentCount();
+      const orders = await paymentsCollection.estimatedDocumentCount();
+      // this is not the best way
+      // const payments = await paymentsCollection.find().toArray();
+      // const revenue = payments.reduce(
+      //   (total, payment) => total + payment.price,
+      //   0
+      // );
+
+      const result = await paymentsCollection
+        .aggregate([
+          {
+            $group: {
+              _id: null,
+              totalRevenue: {
+                $sum: "$price",
+              },
+            },
+          },
+        ])
+        .toArray();
+      const revenues = result.length > 0 ? result[0].totalRevenue : 0;
+      const revenue = parseFloat(revenues.toFixed(2));
+
+      res.send({ users, menuItems, orders, revenue });
+    });
+
+    // using aggregate pipeline
+
+    app.get("/order-stats", verifyToken, verifyAdmin, async (req, res) => {
+      const result = await paymentsCollection
+        .aggregate([
+          {
+            $addFields: {
+              menuIds: {
+                $map: {
+                  input: "$menuIds",
+                  as: "menuId",
+                  in: { $toObjectId: "$$menuId" }, // Convert menuId to ObjectId
+                },
+              },
+            },
+          },
+          {
+            $unwind: "$menuIds",
+          },
+          {
+            $lookup: {
+              from: "menu",
+              localField: "menuIds",
+              foreignField: "_id",
+              as: "menuDetails",
+            },
+          },
+          { $unwind: "$menuDetails" },
+          {
+            $group: {
+              _id: "$menuDetails.category",
+              quantity: { $sum: 1 },
+              revenue: { $sum: "$menuDetails.price" },
+            },
+          },
+          {
+            $project: {
+              // change _id:categoryName to category:_id
+              _id: 0,
+              category: "$_id",
+              quantity: "$quantity",
+              revenue: "$revenue",
+            },
+          },
+        ])
+        .toArray();
+
+      res.send(result);
+    });
+
     // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
+    // await client.db("admin").command({ ping: 1 });
     console.log(
       "Pinged your deployment. You successfully connected to MongoDB!"
     );
